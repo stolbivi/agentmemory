@@ -2,7 +2,7 @@
 
 import { InMemoryKV } from "./in-memory-kv.js";
 import { createStdioTransport } from "./transport.js";
-import { getVisibleTools } from "./tools-registry.js";
+import { getVisibleTools, type McpToolDef } from "./tools-registry.js";
 import { getStandalonePersistPath } from "../config.js";
 import { VERSION } from "../version.js";
 import { generateId } from "../state/schema.js";
@@ -31,6 +31,11 @@ const SERVER_INFO = {
 
 const kv = new InMemoryKV(getStandalonePersistPath());
 let modeAnnounced = false;
+
+type ToolCallResponse = {
+  content: Array<{ type: string; text: string }>;
+  isError?: boolean;
+};
 
 function announceMode(handle: Handle): void {
   if (modeAnnounced) return;
@@ -79,6 +84,23 @@ function textResponse(payload: unknown, pretty = false): {
       { type: "text", text: JSON.stringify(payload, null, pretty ? 2 : 0) },
     ],
   };
+}
+
+function localVisibleTools(): McpToolDef[] {
+  return getVisibleTools().filter((t) => IMPLEMENTED_TOOLS.has(t.name));
+}
+
+function isToolCallResponse(value: unknown): value is ToolCallResponse {
+  if (!value || typeof value !== "object") return false;
+  const content = (value as { content?: unknown }).content;
+  return Array.isArray(content);
+}
+
+function isToolsListResponse(
+  value: unknown,
+): value is { tools: McpToolDef[] } {
+  if (!value || typeof value !== "object") return false;
+  return Array.isArray((value as { tools?: unknown }).tools);
 }
 
 interface Validated {
@@ -197,6 +219,24 @@ async function handleProxy(
   }
 }
 
+async function handleProxyToolCall(
+  toolName: string,
+  args: Record<string, unknown>,
+  handle: ProxyHandle,
+  validated?: Validated,
+): Promise<ToolCallResponse> {
+  if (validated) {
+    return handleProxy(validated, handle);
+  }
+
+  const result = await handle.call("/agentmemory/mcp/call", {
+    method: "POST",
+    body: JSON.stringify({ name: toolName, arguments: args }),
+  });
+  if (isToolCallResponse(result)) return result;
+  return textResponse(result, true);
+}
+
 async function handleLocal(
   v: Validated,
   kvInstance: InMemoryKV,
@@ -298,20 +338,45 @@ export async function handleToolCall(
   args: Record<string, unknown>,
   kvInstance: InMemoryKV = kv,
 ): Promise<{ content: Array<{ type: string; text: string }> }> {
-  const validated = validate(toolName, args);
+  const locallyValidated = IMPLEMENTED_TOOLS.has(toolName)
+    ? validate(toolName, args)
+    : undefined;
   const handle = await resolveHandle();
   announceMode(handle);
   if (handle.mode === "proxy") {
     try {
-      return await handleProxy(validated, handle);
+      return await handleProxyToolCall(toolName, args, handle, locallyValidated);
     } catch (err) {
       process.stderr.write(
         `[@agentmemory/mcp] proxy call failed for ${toolName}: ${err instanceof Error ? err.message : String(err)}; invalidating handle and falling back to local KV\n`,
       );
       invalidateHandle();
+      if (!IMPLEMENTED_TOOLS.has(toolName)) {
+        throw err;
+      }
     }
   }
-  return handleLocal(validated, kvInstance);
+  return handleLocal(locallyValidated ?? validate(toolName, args), kvInstance);
+}
+
+export async function listTools(): Promise<{ tools: McpToolDef[] }> {
+  const handle = await resolveHandle();
+  announceMode(handle);
+  if (handle.mode === "proxy") {
+    try {
+      const result = await handle.call("/agentmemory/mcp/tools", {
+        method: "GET",
+      });
+      if (isToolsListResponse(result)) return { tools: result.tools };
+      throw new Error("invalid tools/list response from agentmemory server");
+    } catch (err) {
+      process.stderr.write(
+        `[@agentmemory/mcp] proxy tools/list failed: ${err instanceof Error ? err.message : String(err)}; invalidating handle and falling back to local tool list\n`,
+      );
+      invalidateHandle();
+    }
+  }
+  return { tools: localVisibleTools() };
 }
 
 const transport = createStdioTransport(async (method, params) => {
@@ -330,9 +395,7 @@ const transport = createStdioTransport(async (method, params) => {
       return {};
 
     case "tools/list":
-      return {
-        tools: getVisibleTools().filter((t) => IMPLEMENTED_TOOLS.has(t.name)),
-      };
+      return listTools();
 
     case "tools/call": {
       const toolName = params.name as string;

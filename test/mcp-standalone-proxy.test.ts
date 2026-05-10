@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
-import { handleToolCall } from "../src/mcp/standalone.js";
+import { handleToolCall, listTools } from "../src/mcp/standalone.js";
 import { resetHandleForTests } from "../src/mcp/rest-proxy.js";
 import { InMemoryKV } from "../src/mcp/in-memory-kv.js";
 
@@ -21,6 +21,7 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
   beforeEach(() => {
     resetHandleForTests();
     process.env["AGENTMEMORY_URL"] = BASE;
+    delete process.env["AGENTMEMORY_TOOLS"];
     delete process.env["AGENTMEMORY_SECRET"];
   });
 
@@ -28,6 +29,71 @@ describe("@agentmemory/mcp standalone — server proxy (issue #159)", () => {
     resetHandleForTests();
     globalThis.fetch = originalFetch;
     delete process.env["AGENTMEMORY_URL"];
+    delete process.env["AGENTMEMORY_TOOLS"];
+  });
+
+  it("lists the full server-provided tool set when proxy is up", async () => {
+    process.env["AGENTMEMORY_TOOLS"] = "all";
+    installFetch((url) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/mcp/tools")) {
+        return new Response(
+          JSON.stringify({
+            tools: [
+              { name: "memory_save", description: "Save", inputSchema: { type: "object", properties: {} } },
+              { name: "memory_consolidate", description: "Consolidate", inputSchema: { type: "object", properties: {} } },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await listTools();
+    expect(res.tools.map((t) => t.name)).toEqual([
+      "memory_save",
+      "memory_consolidate",
+    ]);
+  });
+
+  it("falls back to locally implemented visible tools when proxy is down", async () => {
+    process.env["AGENTMEMORY_TOOLS"] = "all";
+    installFetch(() => {
+      throw new Error("ECONNREFUSED");
+    });
+
+    const res = await listTools();
+    const names = res.tools.map((t) => t.name);
+    expect(names).toContain("memory_save");
+    expect(names).toContain("memory_audit");
+    expect(names).not.toContain("memory_consolidate");
+  });
+
+  it("proxies tools that are not implemented by the local fallback", async () => {
+    installFetch((url, init) => {
+      if (url.endsWith("/agentmemory/livez")) return new Response("ok", { status: 200 });
+      if (url.endsWith("/agentmemory/mcp/call")) {
+        const body = JSON.parse((init?.body as string) || "{}");
+        return new Response(
+          JSON.stringify({
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ proxied: body.name }),
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response("not found", { status: 404 });
+    });
+
+    const res = await handleToolCall("memory_consolidate", {});
+    expect(JSON.parse(res.content[0].text)).toEqual({
+      proxied: "memory_consolidate",
+    });
   });
 
   it("proxies memory_sessions to GET /agentmemory/sessions when server is up", async () => {
